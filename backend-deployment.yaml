@@ -1,0 +1,87 @@
+# 1. Backend Specific Secrets
+apiVersion: v1
+kind: Secret
+metadata:
+  name: backend-secret
+type: Opaque
+stringData:
+  JWT_SECRET: your_very_secret_jwt_key_here
+---
+# 2. Spring Boot Backend Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend
+          # This image line will be automatically updated by GitHub Actions SHA Tag
+          image: kaveengayanga12/eventslk-backend:latest 
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: dev
+            - name: DB_HOST
+              value: mysql # Service name of the DB
+            - name: DB_PORT
+              value: "3306"
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: MYSQL_DATABASE
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: MYSQL_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: MYSQL_PASSWORD
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secret
+                  key: JWT_SECRET
+          # Checks if the app is ready to serve traffic
+          readinessProbe:
+            httpGet:
+              path: /auth/health # Ensure this endpoint exists in your Spring Boot app
+              port: 8080
+            initialDelaySeconds: 40
+            periodSeconds: 10
+          # Restarts the pod if it becomes unresponsive
+          livenessProbe:
+            httpGet:
+              path: /auth/health
+              port: 8080
+            initialDelaySeconds: 90
+            periodSeconds: 20
+---
+# 3. Backend Service (Exposed to Frontends)
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+spec:
+  type: NodePort # Used for simple exposure before Ingress setup
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      nodePort: 30080
