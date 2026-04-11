@@ -37,6 +37,8 @@ spec:
       labels:
         app: mysql
     spec:
+      nodeSelector:
+        node-role: storage
       containers:
         - name: mysql
           image: mysql:8.0

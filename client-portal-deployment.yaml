@@ -12,6 +12,8 @@ spec:
       labels:
         app: client-portal
     spec:
+      nodeSelector:
+        node-role: application
       containers:
         - name: client-portal
           image: client-frontend:latest

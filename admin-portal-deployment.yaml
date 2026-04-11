@@ -12,6 +12,8 @@ spec:
       labels:
         app: admin-portal
     spec:
+      nodeSelector:
+        node-role: application
       containers:
         - name: admin-portal
           image: admin-frontend:latest
