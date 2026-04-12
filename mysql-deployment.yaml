@@ -1,3 +1,15 @@
+# ============================================================
+# mysql-deployment.yaml
+# Runs the MySQL 8.0 database on the dedicated storage node.
+#
+# Node selection strategy:
+#   nodeSelector: node-role: storage
+#   The storage node is expected to have the physical (or EBS)
+#   volume attached to it. Pinning MySQL here ensures the
+#   PersistentVolume is always accessible from the same host,
+#   avoiding cross-node volume attachment issues.
+# ============================================================
+
 # 1. Database Secrets
 apiVersion: v1
 kind: Secret
@@ -17,10 +29,10 @@ metadata:
   name: mysql-pvc
 spec:
   accessModes:
-    - ReadWriteOnce
+    - ReadWriteOnce # Only one node can mount this volume at a time (matches single-replica DB)
   resources:
     requests:
-      storage: 5Gi # Minimum storage for AWS EBS
+      storage: 5Gi
 ---
 # 3. MySQL Deployment
 apiVersion: apps/v1
@@ -28,7 +40,7 @@ kind: Deployment
 metadata:
   name: mysql
 spec:
-  replicas: 1
+  replicas: 1 # Single replica — ReadWriteOnce PVC does not support multi-node attachment
   selector:
     matchLabels:
       app: mysql
@@ -37,6 +49,9 @@ spec:
       labels:
         app: mysql
     spec:
+      # Pin this pod to the node labeled 'node-role=storage'.
+      # Apply this label to your storage node with:
+      #   kubectl label node <node-name> node-role=storage
       nodeSelector:
         node-role: storage
       containers:
@@ -47,17 +62,17 @@ spec:
             - containerPort: 3306
           envFrom:
             - secretRef:
-                name: mysql-secret
+                name: mysql-secret # Injects all keys from the Secret above as env vars
           volumeMounts:
             - name: mysql-storage
-              mountPath: /var/lib/mysql
-          # Readiness probe ensures DB is ready to accept connections
+              mountPath: /var/lib/mysql # Default MySQL data directory
+          # Readiness probe — traffic is only sent to this pod once MySQL accepts TCP connections
           readinessProbe:
             tcpSocket:
               port: 3306
             initialDelaySeconds: 20
             periodSeconds: 10
-          # Liveness probe restarts the container if DB crashes
+          # Liveness probe — Kubernetes restarts the container if MySQL stops responding
           livenessProbe:
             tcpSocket:
               port: 3306
@@ -66,7 +81,7 @@ spec:
       volumes:
         - name: mysql-storage
           persistentVolumeClaim:
-            claimName: mysql-pvc
+            claimName: mysql-pvc # References the PVC defined above
 ---
 # 4. MySQL Internal Service
 apiVersion: v1
@@ -80,4 +95,4 @@ spec:
     - name: mysql
       port: 3306
       targetPort: 3306
-  type: ClusterIP # Only accessible inside the cluster
+  type: ClusterIP # Accessible only inside the cluster — never exposed externally

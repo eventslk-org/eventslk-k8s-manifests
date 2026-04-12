@@ -1,3 +1,15 @@
+# ============================================================
+# client-portal-deployment.yaml
+# Runs the React/Nginx client-facing frontend on the application node.
+#
+# Node selection strategy:
+#   nodeSelector: node-role: application
+#   Stateless frontend containers belong on the application node
+#   alongside the backend, keeping all user-facing services on
+#   the same host and away from the storage node.
+# ============================================================
+
+# 1. Client Portal Deployment
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -12,23 +24,30 @@ spec:
       labels:
         app: client-portal
     spec:
+      # Pin this pod to the node labeled 'node-role=application'.
+      # Apply this label to your application node with:
+      #   kubectl label node <node-name> node-role=application
       nodeSelector:
         node-role: application
       containers:
         - name: client-portal
-          image: client-frontend:latest
-          imagePullPolicy: IfNotPresent
+          # GitHub Actions pushes to this repository on every merge to main.
+          # The CI workflow re-tags the image as 'latest' after pushing the SHA tag.
+          image: kaveengayanga12/eventslk-client-portal:latest
+          imagePullPolicy: Always # Always pull so the freshly built image is used after each CI push
           ports:
-            - containerPort: 80
+            - containerPort: 80 # Nginx serves the built React app on port 80
           env:
             - name: API_BASE_URL
-              value: http://localhost:30080
+              value: http://localhost:30080 # Points to the backend NodePort
+          # Readiness probe — only route traffic here once Nginx serves the root page
           readinessProbe:
             httpGet:
               path: /
               port: 80
             initialDelaySeconds: 10
             periodSeconds: 10
+          # Liveness probe — restart the container if Nginx stops responding
           livenessProbe:
             httpGet:
               path: /
@@ -36,16 +55,17 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 20
 ---
+# 2. Client Portal Service
 apiVersion: v1
 kind: Service
 metadata:
   name: client-portal
 spec:
-  type: NodePort
+  type: NodePort # Exposes the client portal on every node's IP at the fixed port below
   selector:
     app: client-portal
   ports:
     - name: http
-      port: 80
-      targetPort: 80
-      nodePort: 30081
+      port: 80       # ClusterIP port (used for internal cluster traffic)
+      targetPort: 80 # Port Nginx listens on inside the container
+      nodePort: 30081 # External port — reachable at <NodeIP>:30081

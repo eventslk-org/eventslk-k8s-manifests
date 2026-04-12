@@ -1,3 +1,15 @@
+# ============================================================
+# backend-deployment.yaml
+# Runs the Spring Boot API on the application node.
+#
+# Node selection strategy:
+#   nodeSelector: node-role: application
+#   The application node handles stateless workloads (backend,
+#   client portal, admin portal). Separating these from the
+#   storage node prevents I/O-heavy database operations from
+#   competing with CPU/memory-intensive API work.
+# ============================================================
+
 # 1. Backend Specific Secrets
 apiVersion: v1
 kind: Secret
@@ -22,20 +34,24 @@ spec:
       labels:
         app: backend
     spec:
+      # Pin this pod to the node labeled 'node-role=application'.
+      # Apply this label to your application node with:
+      #   kubectl label node <node-name> node-role=application
       nodeSelector:
         node-role: application
       containers:
         - name: backend
-          # This image line will be automatically updated by GitHub Actions SHA Tag
-          image: kaveengayanga12/eventslk-backend:latest 
-          imagePullPolicy: Always
+          # The GitHub Actions workflow updates this tag to the commit SHA on every push to main.
+          # Starting with 'latest' allows a manual first deployment before CI runs.
+          image: kaveengayanga12/eventslk-backend:latest
+          imagePullPolicy: Always # Always pull so the new SHA-tagged image is fetched after each CI push
           ports:
             - containerPort: 8080
           env:
             - name: SPRING_PROFILES_ACTIVE
               value: dev
             - name: DB_HOST
-              value: mysql # Service name of the DB
+              value: mysql # Resolves via the ClusterIP Service named 'mysql'
             - name: DB_PORT
               value: "3306"
             - name: DB_NAME
@@ -58,14 +74,14 @@ spec:
                 secretKeyRef:
                   name: backend-secret
                   key: JWT_SECRET
-          # Checks if the app is ready to serve traffic
+          # Readiness probe — pod only receives traffic once the health endpoint returns 200
           readinessProbe:
             httpGet:
-              path: /auth/health # Ensure this endpoint exists in your Spring Boot app
+              path: /auth/health
               port: 8080
             initialDelaySeconds: 40
             periodSeconds: 10
-          # Restarts the pod if it becomes unresponsive
+          # Liveness probe — Kubernetes restarts the pod if the health endpoint stops responding
           livenessProbe:
             httpGet:
               path: /auth/health
@@ -73,17 +89,17 @@ spec:
             initialDelaySeconds: 90
             periodSeconds: 20
 ---
-# 3. Backend Service (Exposed to Frontends)
+# 3. Backend Service
 apiVersion: v1
 kind: Service
 metadata:
   name: backend
 spec:
-  type: NodePort # Used for simple exposure before Ingress setup
+  type: NodePort # Exposes the API on every node's IP at the fixed port below
   selector:
     app: backend
   ports:
     - name: http
-      port: 8080
-      targetPort: 8080
-      nodePort: 30080
+      port: 8080       # ClusterIP port (used by other pods inside the cluster)
+      targetPort: 8080 # Port the Spring Boot container listens on
+      nodePort: 30080  # External port — reachable at <NodeIP>:30080
