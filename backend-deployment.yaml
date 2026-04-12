@@ -43,7 +43,7 @@ spec:
         - name: backend
           # The GitHub Actions workflow updates this tag to the commit SHA on every push to main.
           # Starting with 'latest' allows a manual first deployment before CI runs.
-          image: kaveengayanga12/eventslk-backend:latest
+          image: kaveengayanga12/eventslk-backend:ee5f9f13776eff80a61fe57170b0f670793d548e
           imagePullPolicy: Always # Always pull so the new SHA-tagged image is fetched after each CI push
           ports:
             - containerPort: 8080
