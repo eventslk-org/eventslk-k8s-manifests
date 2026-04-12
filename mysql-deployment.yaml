@@ -114,9 +114,9 @@ metadata:
 type: Opaque
 stringData:
   MYSQL_DATABASE: event_reg_db
-  MYSQL_USER: event_user
-  MYSQL_PASSWORD: event_user_password
-  MYSQL_ROOT_PASSWORD: root_password_change_me
+  MYSQL_USER: root
+  MYSQL_PASSWORD: "EventLK123@#$"
+  MYSQL_ROOT_PASSWORD: "EventLK123@#$"
 ---
 # 2. MySQL Deployment
 apiVersion: apps/v1
