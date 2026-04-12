@@ -114,7 +114,7 @@ metadata:
 type: Opaque
 stringData:
   MYSQL_DATABASE: event_reg_db
-  MYSQL_USER: root
+  MYSQL_USER: event_user
   MYSQL_PASSWORD: "EventLK123@#$"
   MYSQL_ROOT_PASSWORD: "EventLK123@#$"
 ---
