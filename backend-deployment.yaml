@@ -142,7 +142,7 @@ spec:
       containers:
         - name: backend
           # Tagged with the current commit SHA from your logs
-          image: kaveengayanga12/eventslk-backend:85bdcb76f7
+          image: kaveengayanga12/eventslk-backend:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
