@@ -167,6 +167,9 @@ spec:
                   name: mysql-secret
                   key: MYSQL_PASSWORD
 
+            - name: SPRING_JPA_HIBERNATE_DDL_AUTO
+              value: "update"
+
             # Keep original vars for custom application logic if needed
             - name: DB_HOST
               value: mysql
@@ -182,13 +185,13 @@ spec:
           
           readinessProbe:
             httpGet:
-              path: /auth/health
+              path: /auth
               port: 8080
             initialDelaySeconds: 60 # Increased delay to allow DB connection
             periodSeconds: 10
           livenessProbe:
             httpGet:
-              path: /auth/health
+              path: /auth
               port: 8080
             initialDelaySeconds: 120 # Increased delay for Hibernate startup
             periodSeconds: 20
