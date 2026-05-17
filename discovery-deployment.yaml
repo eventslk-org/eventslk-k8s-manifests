@@ -1,0 +1,56 @@
+# ============================================================
+# discovery-deployment.yaml
+# Eureka-style service discovery. All microservices register
+# here so the API gateway can route by service name.
+# ============================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eventslk-service-discovery
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: eventslk-service-discovery
+  template:
+    metadata:
+      labels:
+        app: eventslk-service-discovery
+    spec:
+      nodeSelector:
+        node-role: application
+      containers:
+        - name: eventslk-service-discovery
+          image: kaveengayanga12/eventslk-service-discovery:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8761
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: dev
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8761
+            initialDelaySeconds: 40
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8761
+            initialDelaySeconds: 90
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: eventslk-service-discovery
+spec:
+  type: ClusterIP
+  selector:
+    app: eventslk-service-discovery
+  ports:
+    - name: http
+      port: 8761
+      targetPort: 8761
