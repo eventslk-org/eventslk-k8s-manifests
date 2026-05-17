@@ -23,7 +23,7 @@ spec:
         node-role: application
       containers:
         - name: eventslk-api-gateway
-          image: kaveengayanga12/eventslk-api-gateway:latest
+          image: kaveengayanga12/eventslk-api-gateway:7819c29627fbb8b95e2775e3334ebc3a37ec4ccb
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
