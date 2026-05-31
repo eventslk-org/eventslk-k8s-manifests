@@ -23,7 +23,7 @@ spec:
         node-role: application
       containers:
         - name: event-registration-api
-          image: kaveengayanga12/eventslk-event-registration-api:1b2c1e8d22fd0da6d72ba560ecd471c3f8753c38
+          image: kaveengayanga12/eventslk-event-registration-api:d97284833083151adbcb533f9b02c47abd5900ad
           imagePullPolicy: Always
           ports:
             - containerPort: 8081
