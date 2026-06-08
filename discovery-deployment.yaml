@@ -22,7 +22,7 @@ spec:
         node-role: application
       containers:
         - name: eventslk-service-discovery
-          image: kaveengayanga12/eventslk-service-discovery:b1fabb8dbb6b6247433952b0e7cd2d9d7cf02fa0
+          image: kaveengayanga12/eventslk-service-discovery:328454c480be3cda7dcaba7386fe1ef43659cfd5
           imagePullPolicy: Always
           ports:
             - containerPort: 8761
