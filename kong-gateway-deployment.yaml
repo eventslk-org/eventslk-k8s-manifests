@@ -1,0 +1,192 @@
+# ============================================================
+# kong-gateway-deployment.yaml
+# Kong API Gateway running in DB-less (declarative) mode on EKS.
+# Replaces the Docker Compose Kong setup; host.docker.internal
+# upstream targets are swapped for cluster-local Service DNS.
+#
+# Contains:
+#   1. ConfigMap  kong-declarative-config  -> mounts kong.yaml
+#   2. Deployment kong-gateway             -> kong:3.5, DB-less
+#   3. Service    kong-proxy-svc           -> ClusterIP 8000/8001
+#   4. Ingress    kong-proxy-ingress       -> internet-facing ALB
+#                                              fronting proxy port 8000
+#
+# NOTE: the admin port (8001) is intentionally ClusterIP-only and is
+# NEVER fronted by the ALB. Do not add it to the Ingress.
+# ============================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kong-declarative-config
+  labels:
+    app: kong-gateway
+data:
+  kong.yaml: |
+    _format_version: "3.0"
+    _transform: true
+    services:
+      - name: core-platform-service
+        host: EVENT-REGISTRATION-API-UPSTREAM
+        routes:
+          - name: auth-routes
+            paths: [/auth]
+            strip_path: false
+          - name: event-routes
+            paths: [/event]
+            strip_path: false
+          - name: booking-routes
+            paths: [/book]
+            strip_path: false
+          - name: user-routes
+            paths: [/user]
+            strip_path: false
+          - name: core-actuator-routes
+            paths: [/actuator]
+            strip_path: false
+      - name: notification-api-service
+        host: NOTIFICATION-SERVICE-UPSTREAM
+        routes:
+          - name: notification-actuator-routes
+            paths: [/notification/actuator]
+            strip_path: true
+          - name: notification-debug-routes
+            paths: [/notification/debug]
+            strip_path: true
+    upstreams:
+      - name: EVENT-REGISTRATION-API-UPSTREAM
+        targets:
+          - target: event-registration-api.default.svc.cluster.local:8081
+      - name: NOTIFICATION-SERVICE-UPSTREAM
+        targets:
+          - target: eventslk-notification-service.default.svc.cluster.local:8082
+    plugins:
+      - name: rate-limiting
+        config:
+          minute: 60
+          policy: local
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kong-gateway
+  labels:
+    app: kong-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kong-gateway
+  template:
+    metadata:
+      labels:
+        app: kong-gateway
+    spec:
+      containers:
+        - name: kong-gateway
+          image: kong:3.5
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: KONG_DATABASE
+              value: "off"
+            - name: KONG_DECLARATIVE_CONFIG
+              value: /usr/local/kong/declarative/kong.yaml
+            - name: KONG_PROXY_ACCESS_LOG
+              value: /dev/stdout
+            - name: KONG_ADMIN_ACCESS_LOG
+              value: /dev/stdout
+            - name: KONG_PROXY_ERROR_LOG
+              value: /dev/stderr
+            - name: KONG_ADMIN_ERROR_LOG
+              value: /dev/stderr
+            - name: KONG_PROXY_LISTEN
+              value: 0.0.0.0:8000
+            # Admin API bound to localhost would block kubectl/in-cluster
+            # access; 0.0.0.0 keeps it reachable but it is only exposed
+            # via the ClusterIP Service (never as a LoadBalancer).
+            - name: KONG_ADMIN_LISTEN
+              value: 0.0.0.0:8001
+          ports:
+            - name: proxy
+              containerPort: 8000
+            - name: admin
+              containerPort: 8001
+          volumeMounts:
+            - name: kong-declarative
+              mountPath: /usr/local/kong/declarative/
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /status
+              port: 8001
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /status
+              port: 8001
+            initialDelaySeconds: 30
+            periodSeconds: 20
+      volumes:
+        - name: kong-declarative
+          configMap:
+            name: kong-declarative-config
+            items:
+              - key: kong.yaml
+                path: kong.yaml
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kong-proxy-svc
+  labels:
+    app: kong-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app: kong-gateway
+  ports:
+    - name: proxy
+      port: 8000
+      targetPort: 8000
+    - name: admin
+      port: 8001
+      targetPort: 8001
+---
+# ------------------------------------------------------------
+# Internet-facing ALB fronting ONLY the Kong proxy port (8000).
+# Requires the AWS Load Balancer Controller installed in the
+# cluster. The admin port (8001) is deliberately excluded.
+# ------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kong-proxy-ingress
+  labels:
+    app: kong-gateway
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    # Health-check the Kong Admin API status endpoint on the proxy pods.
+    alb.ingress.kubernetes.io/healthcheck-port: "8001"
+    alb.ingress.kubernetes.io/healthcheck-path: /status
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kong-proxy-svc
+                port:
+                  number: 8000
