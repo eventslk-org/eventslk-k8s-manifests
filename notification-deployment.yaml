@@ -22,7 +22,7 @@ spec:
         node-role: application
       containers:
         - name: eventslk-notification-service
-          image: kaveengayanga12/eventslk-notification-service:d6073c07dffd2a2f7115c47962b62df3fdb86518
+          image: kaveengayanga12/eventslk-notification-service:2a8a7b0a5e3b84d93851d20ce361d4772dfa95ea
           imagePullPolicy: Always
           ports:
             - containerPort: 8082
