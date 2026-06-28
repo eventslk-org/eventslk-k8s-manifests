@@ -33,6 +33,15 @@ spec:
             - name: EUREKA_CLIENT_SERVICEURL_DEFAULTZONE
               value: http://eventslk-service-discovery:8761/eureka/
 
+            # --- Kafka (producer side of the notification pipeline) ---
+            # In-cluster broker provided by kafka-deployment.yaml. The
+            # NotificationProducer publishes booking/user events here; the
+            # eventslk-notification-service consumes them.
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: kafka:29092
+            - name: SPRING_KAFKA_BOOTSTRAP_SERVERS
+              value: kafka:29092
+
             # --- PostgreSQL datasource ---
             - name: SPRING_DATASOURCE_URL
               value: jdbc:postgresql://postgresdb:5432/event_reg_db
