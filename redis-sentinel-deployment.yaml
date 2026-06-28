@@ -1,0 +1,293 @@
+# ============================================================
+# redis-sentinel-deployment.yaml
+# High-availability Redis cache used by the production profile
+# (application-prod.yml -> spring.data.redis.sentinel).
+#
+# application-prod.yml expects:
+#   REDIS_SENTINEL_MASTER = evtreg-master
+#   REDIS_SENTINEL_NODES  = host1:26379,host2:26379,host3:26379
+#   REDIS_PASSWORD        = data-plane auth (requirepass / masterauth)
+#   REDIS_SENTINEL_PASSWORD = sentinel control-plane auth
+#
+# Topology (1 master + 2 replicas + 3 sentinels):
+#   - StatefulSet `redis` with 3 pods, each running TWO containers:
+#       * redis     -> the data node (master or replica)
+#       * sentinel  -> monitors the master and orchestrates failover
+#   - On boot every redis node asks the existing sentinels who the
+#     current master is. If one is known it replicates from it;
+#     otherwise redis-0 bootstraps as the initial master.
+#   - Sentinels reach quorum 2/3 to promote a replica when the master
+#     fails, so the cache survives the loss of any single pod/node.
+#
+# Spring Data Redis (Lettuce) only needs the sentinel addresses; it
+# discovers the live master automatically and follows failovers.
+# ============================================================
+
+# ------------------------------------------------------------
+# 1. Credentials. Replace before applying.
+# ------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis-ha-secret
+type: Opaque
+stringData:
+  REDIS_PASSWORD: "CHANGE_ME_redis_password"
+  REDIS_SENTINEL_PASSWORD: "CHANGE_ME_sentinel_password"
+---
+# ------------------------------------------------------------
+# 2. Startup scripts + config templates for the redis and
+#    sentinel containers. Templates are copied to a writable
+#    tmpfs at boot because both processes rewrite their config.
+# ------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-sentinel-scripts
+  labels:
+    app: redis
+data:
+  redis-entrypoint.sh: |
+    #!/bin/sh
+    set -eu
+    MASTER_NAME="evtreg-master"
+    SENTINEL_SVC="redis-sentinel"
+    FQDN="${HOSTNAME}.redis-headless.${POD_NAMESPACE}.svc.cluster.local"
+    ORDINAL="${HOSTNAME##*-}"
+
+    # Ask any running sentinel who the current master is (empty on a cold cluster).
+    MASTER_FQDN=""
+    ADDR="$(redis-cli -h "$SENTINEL_SVC" -p 26379 -a "$REDIS_SENTINEL_PASSWORD" --no-auth-warning \
+            sentinel get-master-addr-by-name "$MASTER_NAME" 2>/dev/null | head -1 || true)"
+    if [ -n "$ADDR" ]; then
+      MASTER_FQDN="$ADDR"
+    elif [ "$ORDINAL" != "0" ]; then
+      # Cold start, not the seed pod -> follow the seed master.
+      MASTER_FQDN="redis-0.redis-headless.${POD_NAMESPACE}.svc.cluster.local"
+    fi
+
+    cat > /tmp/redis.conf <<EOF
+    port 6379
+    dir /data
+    appendonly yes
+    requirepass ${REDIS_PASSWORD}
+    masterauth ${REDIS_PASSWORD}
+    maxmemory 256mb
+    maxmemory-policy allkeys-lru
+    replica-announce-ip ${FQDN}
+    EOF
+
+    if [ -n "$MASTER_FQDN" ] && [ "$MASTER_FQDN" != "$FQDN" ]; then
+      echo "Starting as REPLICA of ${MASTER_FQDN}"
+      echo "replicaof ${MASTER_FQDN} 6379" >> /tmp/redis.conf
+    else
+      echo "Starting as MASTER (${FQDN})"
+    fi
+
+    exec redis-server /tmp/redis.conf
+  sentinel-entrypoint.sh: |
+    #!/bin/sh
+    set -eu
+    MASTER_NAME="evtreg-master"
+    # Bootstrap master = the seed pod. `resolve-hostnames yes` (set below,
+    # before `monitor`) lets Sentinel accept a hostname here — no glibc
+    # `getent`/`nslookup` needed on the Alpine image. Sentinel then
+    # auto-discovers replicas and tracks failovers from this seed.
+    SEED="redis-0.redis-headless.${POD_NAMESPACE}.svc.cluster.local"
+
+    cat > /tmp/sentinel.conf <<EOF
+    port 26379
+    requirepass ${REDIS_SENTINEL_PASSWORD}
+    sentinel resolve-hostnames yes
+    sentinel announce-hostnames yes
+    sentinel monitor ${MASTER_NAME} ${SEED} 6379 2
+    sentinel auth-pass ${MASTER_NAME} ${REDIS_PASSWORD}
+    sentinel down-after-milliseconds ${MASTER_NAME} 5000
+    sentinel failover-timeout ${MASTER_NAME} 10000
+    sentinel parallel-syncs ${MASTER_NAME} 1
+    EOF
+
+    exec redis-sentinel /tmp/sentinel.conf
+---
+# ------------------------------------------------------------
+# 3. Redis StatefulSet — 3 data nodes, each with a sentinel sidecar.
+# ------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  labels:
+    app: redis
+spec:
+  serviceName: redis-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      nodeSelector:
+        node-role: application
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: redis
+      securityContext:
+        fsGroup: 999          # redis:7-alpine runs as uid/gid 999
+      containers:
+        # --- Data node ---
+        - name: redis
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/scripts/redis-entrypoint.sh"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-ha-secret
+                  key: REDIS_PASSWORD
+            - name: REDIS_SENTINEL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-ha-secret
+                  key: REDIS_SENTINEL_PASSWORD
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: scripts
+              mountPath: /scripts
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "redis-cli -a \"$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+        # --- Sentinel sidecar ---
+        - name: sentinel
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/scripts/sentinel-entrypoint.sh"]
+          ports:
+            - name: sentinel
+              containerPort: 26379
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-ha-secret
+                  key: REDIS_PASSWORD
+            - name: REDIS_SENTINEL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-ha-secret
+                  key: REDIS_SENTINEL_PASSWORD
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+          readinessProbe:
+            tcpSocket:
+              port: 26379
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 26379
+            initialDelaySeconds: 40
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: scripts
+          configMap:
+            name: redis-sentinel-scripts
+            defaultMode: 0755
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # storageClassName: gp3
+        resources:
+          requests:
+            storage: 5Gi
+---
+# ------------------------------------------------------------
+# 4. Headless Service — stable per-pod DNS for redis + sentinel.
+#    redis-0.redis-headless ... redis-2.redis-headless
+# ------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-headless
+  labels:
+    app: redis
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+    - name: sentinel
+      port: 26379
+      targetPort: 26379
+---
+# ------------------------------------------------------------
+# 5. Sentinel Service — the discovery endpoint Spring connects to.
+#    Wire the app with the per-pod sentinel DNS names:
+#      REDIS_SENTINEL_NODES=redis-0.redis-headless.default.svc.cluster.local:26379,\
+#                           redis-1.redis-headless.default.svc.cluster.local:26379,\
+#                           redis-2.redis-headless.default.svc.cluster.local:26379
+#    (this ClusterIP Service is also handy for ad-hoc sentinel queries).
+# ------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-sentinel
+  labels:
+    app: redis
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+  ports:
+    - name: sentinel
+      port: 26379
+      targetPort: 26379
