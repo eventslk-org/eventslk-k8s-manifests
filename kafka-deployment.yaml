@@ -1,0 +1,251 @@
+# ============================================================
+# kafka-deployment.yaml
+# Kafka message bus connecting the event-registration-api
+# (producer) and the EventsLK-NotificationService (consumer).
+#
+# Topology:
+#   - KRaft mode (no ZooKeeper), combined broker + controller
+#   - 3-broker StatefulSet for high availability
+#   - Topics created with replication-factor 3, min.insync.replicas 2
+#     so the cluster tolerates the loss of a single broker with no
+#     data loss and no message-delivery interruption.
+#
+# Producer  : event-registration-api      -> publishes booking/user events
+# Consumer  : eventslk-notification-service -> dispatches emails (Brevo)
+# Topics    : eventslk.user.signup, eventslk.user.otp,
+#             eventslk.booking.confirmed, eventslk.booking.cancelled,
+#             eventslk.promotion
+#
+# In-cluster bootstrap endpoint: kafka:29092  (matches the value
+# already wired into notification-deployment.yaml). PLAINTEXT is used
+# on the pod network; for true production enable SASL_SSL / SCRAM as
+# described in application-prod.yml (KAFKA_SECURITY_PROTOCOL=SASL_SSL,
+# SCRAM-SHA-512) and front it with per-broker TLS certs.
+# ============================================================
+
+# ------------------------------------------------------------
+# 1. Headless Service — stable, per-broker DNS for the KRaft
+#    quorum and for advertised listeners. Each broker is reachable
+#    at kafka-<ordinal>.kafka-headless.<ns>.svc.cluster.local.
+# ------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-headless
+  labels:
+    app: kafka
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true   # brokers must resolve peers before they are "ready"
+  selector:
+    app: kafka
+  ports:
+    - name: broker
+      port: 29092
+      targetPort: 29092
+    - name: controller
+      port: 9093
+      targetPort: 9093
+---
+# ------------------------------------------------------------
+# 2. Client Service — the bootstrap endpoint applications use.
+#    Round-robins TCP connections across the 3 brokers; clients
+#    then follow the per-broker advertised listeners returned in
+#    the metadata response.
+# ------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  labels:
+    app: kafka
+spec:
+  type: ClusterIP
+  selector:
+    app: kafka
+  ports:
+    - name: broker
+      port: 29092
+      targetPort: 29092
+---
+# ------------------------------------------------------------
+# 3. Kafka StatefulSet — 3 KRaft brokers (combined roles).
+# ------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  labels:
+    app: kafka
+spec:
+  serviceName: kafka-headless
+  replicas: 3
+  podManagementPolicy: Parallel    # brokers bootstrap together to form the quorum
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      nodeSelector:
+        node-role: application
+      # Spread brokers across distinct nodes so a single node failure
+      # never takes down more than one broker.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: kafka
+      securityContext:
+        # apache/kafka runs as uid 1000; fsGroup makes the mounted
+        # PVC group-writable so the broker can create its log dirs.
+        fsGroup: 1000
+      containers:
+        - name: kafka
+          image: apache/kafka:3.8.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: broker
+              containerPort: 29092
+            - name: controller
+              containerPort: 9093
+          # NODE_ID and ADVERTISED_LISTENERS are per-pod, so they are
+          # derived from the StatefulSet ordinal in the hostname before
+          # handing control to the stock entrypoint.
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              ORDINAL="${HOSTNAME##*-}"
+              export KAFKA_NODE_ID="${ORDINAL}"
+              export KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://${HOSTNAME}.kafka-headless.${POD_NAMESPACE}.svc.cluster.local:29092"
+              echo "Starting Kafka broker node.id=${KAFKA_NODE_ID} advertised=${KAFKA_ADVERTISED_LISTENERS}"
+              exec /etc/kafka/docker/run
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Shared cluster id — MUST be identical on every broker so they
+            # format the same KRaft metadata log. Regenerate with
+            # `kafka-storage random-uuid` if you want your own.
+            - name: CLUSTER_ID
+              value: "EvtLKkRaftCluster01A"
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "0@kafka-0.kafka-headless.default.svc.cluster.local:9093,1@kafka-1.kafka-headless.default.svc.cluster.local:9093,2@kafka-2.kafka-headless.default.svc.cluster.local:9093"
+            - name: KAFKA_LISTENERS
+              value: "PLAINTEXT://:29092,CONTROLLER://:9093"
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: "PLAINTEXT"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+            - name: KAFKA_LOG_DIRS
+              value: "/var/lib/kafka/data"
+            # --- Durability / HA defaults applied to internal + new topics ---
+            - name: KAFKA_DEFAULT_REPLICATION_FACTOR
+              value: "3"
+            - name: KAFKA_MIN_INSYNC_REPLICAS
+              value: "2"
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "3"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "3"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "2"
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              value: "false"   # topics are created explicitly by the init Job below
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            tcpSocket:
+              port: 29092
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 29092
+            initialDelaySeconds: 45
+            periodSeconds: 20
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # Set to your cluster's block storage class (e.g. gp3 on EKS,
+        # standard on GKE). Remove to use the default StorageClass.
+        # storageClassName: gp3
+        resources:
+          requests:
+            storage: 10Gi
+---
+# ------------------------------------------------------------
+# 4. Topic bootstrap Job — idempotently creates every topic the
+#    services rely on with HA settings (RF=3, min.insync=2).
+#    Re-running is safe thanks to --if-not-exists.
+# ------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-topic-init
+  labels:
+    app: kafka
+spec:
+  backoffLimit: 10
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: kafka-topic-init
+    spec:
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role: application
+      containers:
+        - name: create-topics
+          image: apache/kafka:3.8.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              BOOTSTRAP="kafka:29092"
+              echo "Waiting for Kafka to accept connections at ${BOOTSTRAP}..."
+              until /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server "${BOOTSTRAP}" >/dev/null 2>&1; do
+                echo "  ...broker not ready yet, retrying in 5s"; sleep 5
+              done
+              for TOPIC in \
+                eventslk.user.signup \
+                eventslk.user.otp \
+                eventslk.booking.confirmed \
+                eventslk.booking.cancelled \
+                eventslk.promotion ; do
+                echo "Ensuring topic ${TOPIC}"
+                /opt/kafka/bin/kafka-topics.sh --bootstrap-server "${BOOTSTRAP}" \
+                  --create --if-not-exists \
+                  --topic "${TOPIC}" \
+                  --partitions 3 \
+                  --replication-factor 3 \
+                  --config min.insync.replicas=2
+              done
+              echo "All topics ensured:"
+              /opt/kafka/bin/kafka-topics.sh --bootstrap-server "${BOOTSTRAP}" --list
