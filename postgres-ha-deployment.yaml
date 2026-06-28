@@ -1,0 +1,326 @@
+# ============================================================
+# postgres-ha-deployment.yaml
+# High-availability PostgreSQL 16 topology that backs the
+# production profile (application-prod.yml).
+#
+# application-prod.yml expects a primary/replica split:
+#   DB_PRIMARY_HOST   -> writes  (postgres-primary)
+#   DB_REPLICA_HOSTS  -> reads   (postgres-replica-0..N, JDBC load-balanced)
+# The app's AbstractRoutingDataSource sends read-only transactions to
+# the replicas and writes to the primary.
+#
+# Architecture:
+#   - postgres-primary : 1 writable StatefulSet pod (streaming source)
+#   - postgres-replica : N hot-standby StatefulSet pods that stream WAL
+#                        from the primary via physical replication
+#   - postgres-primary : ClusterIP Service (write endpoint)
+#   - postgres-replica : headless Service giving each standby stable DNS
+#                        so they can be listed individually in
+#                        DB_REPLICA_HOSTS for JDBC host load balancing.
+#
+# This replaces the single-instance postgres-deployment.yaml when you
+# move from the `dev` profile to `prod`. Keep ONE of them applied at a
+# time per database to avoid name/role confusion.
+#
+# NOTE on storage: this manifest uses volumeClaimTemplates + a
+# StorageClass (not hostPath) so each replica gets its own durable
+# volume and can be scheduled on different nodes. True HA requires
+# more than one node able to provision/attach these volumes.
+# ============================================================
+
+# ------------------------------------------------------------
+# 1. Credentials. Replace these before applying — do not commit
+#    real production secrets. REPLICATION_* drives the physical
+#    streaming-replication connection from standbys to the primary.
+# ------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-ha-secret
+type: Opaque
+stringData:
+  POSTGRES_DB: event_reg_db
+  POSTGRES_USER: evtreg
+  POSTGRES_PASSWORD: "CHANGE_ME_app_password"
+  REPLICATION_USER: replicator
+  REPLICATION_PASSWORD: "CHANGE_ME_replication_password"
+---
+# ------------------------------------------------------------
+# 2. Primary init script. Runs once on first boot of the primary:
+#    creates the replication role and opens pg_hba for streaming
+#    replication + application connections (scram-sha-256).
+# ------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-primary-init
+  labels:
+    app: postgres-primary
+data:
+  00-init-replication.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    # Create the physical-replication role used by the standbys.
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+      DO \$\$
+      BEGIN
+        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${REPLICATION_USER}') THEN
+          CREATE ROLE ${REPLICATION_USER} WITH REPLICATION LOGIN PASSWORD '${REPLICATION_PASSWORD}';
+        END IF;
+      END
+      \$\$;
+    EOSQL
+    # Allow replication + app connections from the pod network.
+    {
+      echo "host replication ${REPLICATION_USER} 0.0.0.0/0 scram-sha-256"
+      echo "host all all 0.0.0.0/0 scram-sha-256"
+    } >> "$PGDATA/pg_hba.conf"
+---
+# ------------------------------------------------------------
+# 3. Primary StatefulSet — the single writable node.
+#    WAL settings enable streaming replication with replication
+#    slots so the primary retains WAL until standbys catch up.
+# ------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-primary
+  labels:
+    app: postgres-primary
+    role: primary
+spec:
+  serviceName: postgres-primary
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-primary
+  template:
+    metadata:
+      labels:
+        app: postgres-primary
+        role: primary
+    spec:
+      nodeSelector:
+        node-role: storage
+      containers:
+        - name: postgres
+          image: postgres:16
+          imagePullPolicy: IfNotPresent
+          args:
+            - -c
+            - wal_level=replica
+            - -c
+            - max_wal_senders=10
+            - -c
+            - max_replication_slots=10
+            - -c
+            - hot_standby=on
+            - -c
+            - synchronous_commit=on
+            - -c
+            - password_encryption=scram-sha-256
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: postgres-ha-secret
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            # Use scram-sha-256 for the auto-generated pg_hba entries too.
+            - name: POSTGRES_INITDB_ARGS
+              value: "--auth-host=scram-sha-256"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "evtreg", "-d", "event_reg_db"]
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 5432
+            initialDelaySeconds: 60
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: init
+          configMap:
+            name: postgres-primary-init
+            defaultMode: 0755
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # storageClassName: gp3
+        resources:
+          requests:
+            storage: 20Gi
+---
+# ------------------------------------------------------------
+# 4. Primary Service — the write endpoint (DB_PRIMARY_HOST).
+# ------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-primary
+  labels:
+    app: postgres-primary
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres-primary
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+# ------------------------------------------------------------
+# 5. Replica StatefulSet — hot standbys streaming from the primary.
+#    An initContainer runs pg_basebackup once (when the data dir is
+#    empty) to clone the primary and write standby.signal + a
+#    primary_conninfo (pg_basebackup -R). The main container then
+#    boots as a read-only hot standby and streams WAL continuously.
+# ------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-replica
+  labels:
+    app: postgres-replica
+    role: replica
+spec:
+  serviceName: postgres-replica
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: postgres-replica
+  template:
+    metadata:
+      labels:
+        app: postgres-replica
+        role: replica
+    spec:
+      nodeSelector:
+        node-role: storage
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: postgres-replica
+      initContainers:
+        - name: clone-primary
+          image: postgres:16
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              if [ -s "$PGDATA/PG_VERSION" ]; then
+                echo "Standby data dir already initialized — skipping base backup."
+                exit 0
+              fi
+              echo "Waiting for primary postgres-primary:5432 ..."
+              until pg_isready -h postgres-primary -p 5432 -U "$POSTGRES_USER"; do sleep 3; done
+              echo "Cloning primary via pg_basebackup ..."
+              export PGPASSWORD="$REPLICATION_PASSWORD"
+              # -R writes standby.signal + primary_conninfo; -Xs streams WAL;
+              # -C --slot creates a permanent replication slot per standby so
+              # the primary keeps WAL until this replica has consumed it.
+              SLOT="standby_${HOSTNAME//-/_}"
+              pg_basebackup -h postgres-primary -p 5432 -U "$REPLICATION_USER" \
+                -D "$PGDATA" -Fp -Xs -P -R -C --slot="$SLOT"
+              chmod 0700 "$PGDATA"
+          envFrom:
+            - secretRef:
+                name: postgres-ha-secret
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      containers:
+        - name: postgres
+          image: postgres:16
+          imagePullPolicy: IfNotPresent
+          args:
+            - -c
+            - hot_standby=on
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: postgres-ha-secret
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "evtreg", "-d", "event_reg_db"]
+            initialDelaySeconds: 25
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 5432
+            initialDelaySeconds: 75
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # storageClassName: gp3
+        resources:
+          requests:
+            storage: 20Gi
+---
+# ------------------------------------------------------------
+# 6. Replica headless Service — gives each standby a stable DNS
+#    name (postgres-replica-0.postgres-replica, postgres-replica-1...).
+#    List these in DB_REPLICA_HOSTS so the Postgres JDBC driver can
+#    load-balance reads across them:
+#      DB_REPLICA_HOSTS=postgres-replica-0.postgres-replica.default.svc.cluster.local:5432,\
+#                       postgres-replica-1.postgres-replica.default.svc.cluster.local:5432
+# ------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-replica
+  labels:
+    app: postgres-replica
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  selector:
+    app: postgres-replica
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
