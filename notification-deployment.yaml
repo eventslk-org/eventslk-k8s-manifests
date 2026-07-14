@@ -1,7 +1,16 @@
 # ============================================================
 # notification-deployment.yaml
-# Notification microservice. Consumes Kafka events emitted by
-# the event-registration API and dispatches outbound notices.
+# Notification microservice (Go). Consumes Kafka events emitted
+# by the event-registration API's transactional outbox and sends
+# transactional email through the Brevo API.
+#
+# Env contract comes from config/config.go (viper):
+#   SERVER_PORT, BROKER_TYPE, KAFKA_BOOTSTRAP_SERVERS,
+#   KAFKA_CONSUMER_GROUP_ID, BREVO_API_KEY, MAIL_FROM,
+#   EUREKA_SERVER_URL, APP_BASE_URL
+#
+# Required secret (create before applying — see README):
+#   notification-secret   BREVO_API_KEY
 # ============================================================
 
 apiVersion: apps/v1
@@ -27,33 +36,47 @@ spec:
           ports:
             - containerPort: 8082
           env:
-            - name: SPRING_PROFILES_ACTIVE
-              value: dev
-            - name: EUREKA_CLIENT_SERVICEURL_DEFAULTZONE
-              value: http://eventslk-service-discovery:8761/eureka/
-
-            # --- Kafka configuration ---
-            # `kafka:29092` is the in-cluster listener exposed by the
-            # broker; switch to the external listener for off-cluster
-            # producers/consumers.
+            - name: SERVER_PORT
+              value: "8082"
+            - name: BROKER_TYPE
+              value: kafka
             - name: KAFKA_BOOTSTRAP_SERVERS
               value: kafka:29092
-            - name: SPRING_KAFKA_BOOTSTRAP_SERVERS
-              value: kafka:29092
-            - name: SPRING_KAFKA_CONSUMER_GROUP_ID
+            - name: KAFKA_CONSUMER_GROUP_ID
               value: eventslk-notification
+            - name: EUREKA_SERVER_URL
+              value: http://eventslk-service-discovery:8761/eureka
+            # Used to build links inside outgoing emails (verification,
+            # booking confirmations) — must be the PUBLIC client-portal
+            # URL. REPLACE with your domain / elastic IP.
+            - name: APP_BASE_URL
+              value: http://REPLACE_PUBLIC_HOST:30081
+            - name: MAIL_FROM
+              value: no-reply@eventslk.com
+            - name: BREVO_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: notification-secret
+                  key: BREVO_API_KEY
           readinessProbe:
             httpGet:
               path: /actuator/health
               port: 8082
-            initialDelaySeconds: 40
+            initialDelaySeconds: 10
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /actuator/health
               port: 8082
-            initialDelaySeconds: 90
+            initialDelaySeconds: 30
             periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
 ---
 apiVersion: v1
 kind: Service

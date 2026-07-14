@@ -38,8 +38,12 @@ spec:
           ports:
             - containerPort: 80 # Nginx serves the built React app on port 80
           env:
+            # Evaluated in the VISITOR'S BROWSER (env-config.js), so this
+            # must be the publicly reachable Kong proxy NodePort — never
+            # localhost or a cluster-internal name. REPLACE with your
+            # domain / elastic IP.
             - name: API_BASE_URL
-              value: http://localhost:30080 # Points to the backend NodePort
+              value: http://REPLACE_PUBLIC_HOST:30080
           # Readiness probe — only route traffic here once Nginx serves the root page
           readinessProbe:
             httpGet:

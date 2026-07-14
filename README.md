@@ -1,232 +1,185 @@
 # Kubernetes Manifests
 
-This directory contains the Kubernetes manifests for the EventSLK microservices stack:
+Kubernetes manifests for the EventsLK microservices stack, production profile:
 
-- PostgreSQL 16 database
-- Spring Cloud API gateway
-- Eureka-style service discovery
-- Event registration microservice
-- Notification microservice (Kafka consumer)
-- Client portal frontend
-- Admin portal frontend
+- **Kong API gateway** (DB-less, declarative) — the single public API entry point
+- **Event registration API** (Spring Boot, `prod` profile, Flyway migrations)
+- **Notification service** (Go, Kafka consumer, Brevo email)
+- **Kafka** (3-broker KRaft StatefulSet)
+- **HA PostgreSQL** (primary + 2 streaming replicas)
+- **HA Redis** (3 nodes + Sentinel sidecars, cache backend)
+- **Zipkin** (tracing collector/UI — see prerequisite note in the manifest)
+- **Eureka service discovery**, client portal, admin portal
 
-## What Gets Deployed
+> The Spring Cloud API gateway (`gateway-deployment.yaml`) has been **removed** —
+> Kong replaced it. Kong proxies the raw backend paths (`/auth`, `/event`,
+> `/book`, `/user`) with `strip_path: false`; there is no `/api/v1` prefix.
 
-### PostgreSQL Database
+## Public surface
 
-- Deployment name: `postgresdb`
-- Service name: `postgresdb`
-- Type: `ClusterIP`
-- Port: `5432`
-- Node selector: `node-role=storage`
+Only three NodePorts are exposed (the Terraform security group opens
+30000-32767):
 
-The database pod is pinned to the storage node and mounts data from `/mnt/postgres-data` through `hostPath`. Credentials live in the `postgres-secret` Secret (`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`).
+| Port | What | Notes |
+|---|---|---|
+| `30080` | Kong proxy | All API traffic. Rate-limited 60/min, strips `X-User-*` headers |
+| `30081` | Client portal | nginx static |
+| `30082` | Admin portal | nginx static |
 
-### API Gateway
+Everything else — Kong admin (8001), actuator management port (9081), Zipkin
+(9411), Kafka, Postgres, Redis, Eureka — is ClusterIP/headless only. Keep it
+that way: the SG opens the whole NodePort range to the internet, so **adding a
+NodePort publishes the service**.
 
-- Deployment name: `eventslk-api-gateway`
-- Service name: `eventslk-api-gateway`
-- Type: `NodePort`
-- Container port: `8080`
-- NodePort: `30080`
-- Node selector: `node-role=application`
-
-This is the single external entry point. The legacy `30080` NodePort is preserved so existing frontend configurations keep working.
-
-### Service Discovery
-
-- Deployment name: `eventslk-service-discovery`
-- Service name: `eventslk-service-discovery`
-- Type: `ClusterIP`
-- Container port: `8761`
-- Node selector: `node-role=application`
-
-### Event Registration API
-
-- Deployment name: `event-registration-api`
-- Service name: `event-registration-api`
-- Type: `ClusterIP`
-- Container port: `8081`
-- Node selector: `node-role=application`
-
-Reads PostgreSQL credentials from `postgres-secret` and the JWT signing key from `backend-secret`.
-
-### Notification Service
-
-- Deployment name: `eventslk-notification-service`
-- Service name: `eventslk-notification-service`
-- Type: `ClusterIP`
-- Container port: `8082`
-- Node selector: `node-role=application`
-
-Consumes events from Kafka at `kafka:29092`.
-
-### Kafka (message bus)
-
-- StatefulSet name: `kafka` (3 brokers, KRaft mode — no ZooKeeper)
-- Bootstrap service: `kafka` (ClusterIP) on `29092`
-- Headless service: `kafka-headless` for per-broker DNS + the KRaft controller quorum
-- Topic bootstrap: `kafka-topic-init` Job creates all topics with replication-factor 3, `min.insync.replicas=2`
-- Node selector: `node-role=application`
-
-Carries events from the `event-registration-api` producer to the
-`eventslk-notification-service` consumer. Topics: `eventslk.user.signup`,
-`eventslk.user.otp`, `eventslk.booking.confirmed`, `eventslk.booking.cancelled`,
-`eventslk.promotion`. Defined in [`kafka-deployment.yaml`](./kafka-deployment.yaml).
-
-### High-Availability PostgreSQL (production profile)
-
-- Primary StatefulSet/Service: `postgres-primary` (writes) on `5432`
-- Replica StatefulSet: `postgres-replica` (2 hot standbys, streaming replication)
-- Replica headless Service: `postgres-replica` for per-standby DNS
-- Secret: `postgres-ha-secret`
-- Node selector: `node-role=storage`
-
-Implements the primary/replica split that `application-prod.yml` expects
-(`DB_PRIMARY_HOST` / `DB_REPLICA_HOSTS`). Standbys clone the primary via
-`pg_basebackup` and stream WAL through per-replica replication slots. Defined in
-[`postgres-ha-deployment.yaml`](./postgres-ha-deployment.yaml). This is the
-production alternative to the single-instance `postgres-deployment.yaml` — apply
-only one of the two per database.
-
-### High-Availability Redis (production profile)
-
-- StatefulSet: `redis` (3 nodes, each with a sentinel sidecar)
-- Sentinel service: `redis-sentinel` (ClusterIP) on `26379`
-- Headless service: `redis-headless` for per-pod DNS
-- Secret: `redis-ha-secret`
-- Master name: `evtreg-master`, quorum `2`
-- Node selector: `node-role=application`
-
-Implements the Redis Sentinel topology `application-prod.yml` expects
-(`REDIS_SENTINEL_MASTER` / `REDIS_SENTINEL_NODES`). Defined in
-[`redis-sentinel-deployment.yaml`](./redis-sentinel-deployment.yaml).
-
-### Client Portal
-
-- Deployment name: `client-portal`
-- Service name: `client-portal`
-- Type: `NodePort`
-- Container port: `80`
-- NodePort: `30081`
-- Node selector: `node-role=application`
-
-### Admin Portal
-
-- Deployment name: `admin-portal`
-- Service name: `admin-portal`
-- Type: `NodePort`
-- Container port: `80`
-- NodePort: `30082`
-- Node selector: `node-role=application`
+An ALB Ingress is *not* used: this is a kubeadm + Calico cluster on EC2, where
+the AWS Load Balancer Controller's `target-type: ip` cannot reach pod IPs. If
+you later want an ALB, create it in Terraform with an instance target group on
+port 30080.
 
 ## Prerequisites
 
-- A Kubernetes cluster with at least two labeled nodes
-- A storage node labeled `node-role=storage`
-- An application node labeled `node-role=application`
-- A default `StorageClass` (or set `storageClassName` in the StatefulSet
-  `volumeClaimTemplates`) for the Kafka / HA-Postgres / Redis persistent volumes
-- `kubectl` configured against the target cluster
+1. **Cluster** built by `deploy/infrastructure` (Terraform → EC2, Ansible →
+   kubeadm + Calico + ArgoCD). One worker labeled per role:
 
-Kafka is now provided in-cluster by [`kafka-deployment.yaml`](./kafka-deployment.yaml)
-(`kafka:29092`); you no longer need an external broker.
+   ```bash
+   kubectl label node <storage-node>     node-role=storage
+   kubectl label node <application-node> node-role=application
+   ```
 
-Label nodes if needed:
+2. **A default StorageClass.** kubeadm clusters ship with none, so the
+   Kafka / HA-Postgres / Redis `volumeClaimTemplates` would stay `Pending`
+   forever. Install the local-path provisioner and make it the default:
+
+   ```bash
+   kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.30/deploy/local-path-storage.yaml
+   kubectl patch storageclass local-path -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+   ```
+
+   (Local-path volumes live on the node's disk — data survives pod restarts
+   but not node loss. For real durability move to EBS-backed storage later.)
+
+3. **Capacity.** With 2× `m7i-flex.large` workers (8 GiB each) the full HA
+   stack is *tight*: Kafka×3 + Redis×3 + Postgres×3 + apps. Either raise
+   `worker_count` in `terraform.tfvars` (label ≥2 as `application`), or trim
+   replica counts (Kafka 3→1 also means changing its replication-factor env
+   and the topic-init job). Anti-affinity in the HA manifests is *preferred*,
+   not required, so pods will co-locate on a single node — that runs, but a
+   node loss takes out every "replica" at once.
+
+4. **Secrets** (all in `default` namespace; never commit real values):
+
+   ```bash
+   # Postgres HA + Redis HA: edit the CHANGE_ME values inside
+   # postgres-ha-deployment.yaml / redis-sentinel-deployment.yaml before
+   # applying, or better, delete those inline Secrets and create them here:
+
+   kubectl create secret generic postgres-ha-secret \
+     --from-literal=POSTGRES_DB=event_reg_db \
+     --from-literal=POSTGRES_USER=evtreg \
+     --from-literal=POSTGRES_PASSWORD='<strong-password>' \
+     --from-literal=REPLICATION_USER=replicator \
+     --from-literal=REPLICATION_PASSWORD='<strong-password>'
+
+   kubectl create secret generic redis-ha-secret \
+     --from-literal=REDIS_PASSWORD='<strong-password>' \
+     --from-literal=REDIS_SENTINEL_PASSWORD='<strong-password>'
+
+   # Backend: RS256 keypair (PEM with literal \n escapes, same format as the
+   # local .env) + seed admin credentials.
+   kubectl create secret generic backend-secret \
+     --from-literal=JWT_PRIVATE_KEY="$JWT_PRIVATE_KEY" \
+     --from-literal=JWT_PUBLIC_KEY="$JWT_PUBLIC_KEY" \
+     --from-literal=APP_ADMIN_EMAIL='admin@yourdomain' \
+     --from-literal=APP_ADMIN_PASSWORD='<strong-password>'
+
+   # Notification service: Brevo transactional-email API key.
+   kubectl create secret generic notification-secret \
+     --from-literal=BREVO_API_KEY='<brevo-key>'
+
+   # Optional — only if not using the EC2 instance role for S3:
+   kubectl create secret generic aws-s3-secret \
+     --from-literal=AWS_S3_ACCESS_KEY='...' \
+     --from-literal=AWS_S3_SECRET_KEY='...'
+   ```
+
+5. **Replace every `REPLACE_PUBLIC_HOST`** in `event-api-deployment.yaml`,
+   `notification-deployment.yaml`, and the two portal manifests with your
+   public domain or the master's elastic IP. These values end up in browsers
+   (portal `API_BASE_URL`), CORS allowlists, and email links.
+
+6. **S3 image uploads** (`event-api-deployment.yaml`): set `AWS_S3_BUCKET` to
+   enable real uploads (empty = mock mode with placeholder images). Prefer the
+   worker EC2 instance role over static keys — Terraform already sets the IMDS
+   hop limit to 2 so pods can use it; attach an `s3:PutObject`/`GetObject`
+   policy for the bucket. The bucket also needs a CORS rule allowing `PUT`
+   with `Content-Type` + `Cache-Control` headers from the admin-portal origin,
+   and public (or CloudFront-fronted) read for `events/*`.
+
+## Apply order
 
 ```bash
-kubectl label node <storage-node> node-role=storage
-kubectl label node <application-node> node-role=application
-```
-
-The `backend-secret` Secret (containing `JWT_SECRET`) must exist before applying the event registration manifest. It is created automatically when `event-api-deployment.yaml` is applied for the first time only if you add it; otherwise create it ahead of time:
-
-```bash
-kubectl create secret generic backend-secret \
-  --from-literal=JWT_SECRET=<your-jwt-secret>
-```
-
-## Apply Order
-
-Apply the manifests in this order so service dependencies resolve cleanly:
-
-1. `postgres-deployment.yaml` (dev) **or** `postgres-ha-deployment.yaml` (prod) — database must be reachable before any API pod becomes ready
-2. `redis-sentinel-deployment.yaml` — (prod profile) cache must be up; the prod readiness probe includes Redis
-3. `kafka-deployment.yaml` — message bus must be up before the producer/consumer
-4. `discovery-deployment.yaml` — service registry must be up before other services register
-5. `gateway-deployment.yaml` — gateway depends on discovery for routing
-6. `event-api-deployment.yaml` — depends on PostgreSQL, Kafka, discovery, and `backend-secret`
-7. `notification-deployment.yaml` — depends on Kafka and discovery
-8. `client-portal-deployment.yaml`
-9. `admin-portal-deployment.yaml`
-
-## Deploy
-
-### Dev profile (single-instance datastores)
-
-```bash
-kubectl apply -f postgres-deployment.yaml
-kubectl apply -f kafka-deployment.yaml
-kubectl apply -f discovery-deployment.yaml
-kubectl apply -f gateway-deployment.yaml
-kubectl apply -f event-api-deployment.yaml
-kubectl apply -f notification-deployment.yaml
-kubectl apply -f client-portal-deployment.yaml
-kubectl apply -f admin-portal-deployment.yaml
-```
-
-### Production profile (HA datastores)
-
-Use the HA Postgres + Redis Sentinel manifests instead of the single-instance
-Postgres, and switch the app deployments to `SPRING_PROFILES_ACTIVE=prod` with the
-matching `DB_PRIMARY_HOST` / `DB_REPLICA_HOSTS` / `REDIS_SENTINEL_NODES` /
-`KAFKA_BOOTSTRAP_SERVERS` env (see Configuration Notes below).
-
-```bash
-kubectl apply -f postgres-ha-deployment.yaml
+# datastores first
+kubectl apply -f postgres-ha-deployment.yaml     # or postgres-deployment.yaml (dev only)
 kubectl apply -f redis-sentinel-deployment.yaml
 kubectl apply -f kafka-deployment.yaml
+
+# platform
 kubectl apply -f discovery-deployment.yaml
-kubectl apply -f gateway-deployment.yaml
+kubectl apply -f zipkin-deployment.yaml          # optional (see note in file)
+kubectl apply -f kong-gateway-deployment.yaml
+
+# apps (wait for datastores to be Ready first: kubectl get pods -w)
 kubectl apply -f event-api-deployment.yaml
 kubectl apply -f notification-deployment.yaml
 kubectl apply -f client-portal-deployment.yaml
 kubectl apply -f admin-portal-deployment.yaml
 ```
 
-## Access URLs
+The event API runs Flyway on boot (prod profile, `ddl-auto: validate`), so a
+fresh database is migrated automatically; no manual schema step.
 
-If you are using a node IP, the exposed ports are:
+## Smoke test
 
-- API gateway: `http://<node-ip>:30080`
-- Client portal: `http://<node-ip>:30081`
-- Admin portal: `http://<node-ip>:30082`
+```bash
+PUB=<public-host>
+curl http://$PUB:30080/actuator/health          # via Kong -> mgmt port 9081
+curl http://$PUB:30080/event                    # public event list
+# portals
+open http://$PUB:30081                          # client
+open http://$PUB:30082/login.html               # admin (seed admin creds)
+```
 
-Inside the cluster, the services are reachable by name:
+## In-cluster service names
 
-- `postgresdb:5432`
-- `eventslk-service-discovery:8761`
-- `eventslk-api-gateway:8080`
-- `event-registration-api:8081`
-- `eventslk-notification-service:8082`
-- `client-portal:80`
-- `admin-portal:80`
+| Service | Address |
+|---|---|
+| Kong proxy / admin | `kong-proxy-svc:8000` / `kong-admin-svc:8001` |
+| Event API (http / mgmt) | `event-registration-api:8081` / `:9081` |
+| Notification | `eventslk-notification-service:8082` |
+| Kafka bootstrap | `kafka:29092` |
+| Postgres write endpoint | `postgres-primary:5432` |
+| Postgres replicas (per-pod) | `postgres-replica-0.postgres-replica:5432`, `-1…` |
+| Redis sentinels (per-pod) | `redis-{0,1,2}.redis-headless:26379` |
+| Zipkin | `zipkin:9411` (`kubectl port-forward svc/zipkin 9411:9411`) |
+| Eureka | `eventslk-service-discovery:8761` |
 
-## Configuration Notes
+## Configuration notes
 
-- All Spring Boot services run with `SPRING_PROFILES_ACTIVE=dev`.
-- `event-api-deployment.yaml` supplies `SPRING_DATASOURCE_URL=jdbc:postgresql://postgresdb:5432/event_reg_db` and pulls username/password from `postgres-secret`.
-- `notification-deployment.yaml` points at the in-cluster Kafka listener `kafka:29092`.
-- The frontend manifests set `API_BASE_URL` to `http://localhost:30080`, which now routes through the API gateway.
-- Readiness and liveness probes are enabled for every workload.
+- The event API's prod profile has **no RoutingDataSource implementation yet**
+  — `spring.datasource.primary/replica` in `application-prod.yml` is inert and
+  the manifest wires `SPRING_DATASOURCE_URL` to `postgres-primary`. Reads do
+  not hit the replicas until that bean exists; the replicas still give you a
+  warm standby.
+- In-cluster Kafka is PLAINTEXT, so the manifest overrides the prod SASL/SSL
+  defaults; `KAFKA_SASL_JAAS_CONFIG` must exist (even empty) because Spring
+  binds it. Same idea for Redis: `REDIS_SSL_ENABLED=false`.
+- Actuator runs on management port **9081** with k8s probe groups
+  (`/actuator/health/readiness` includes db + redis). Kong exposes only
+  `/actuator/health` publicly, via a dedicated upstream to 9081.
+- Zipkin receives nothing until the tracing dependencies are added to the
+  Spring API — the exact pom/yml snippet is in `zipkin-deployment.yaml`.
+- Images point at the `kaveengayanga12` registry; update tags to deploy a
+  different build.
 
-## Images
-
-The manifests currently point to prebuilt container images in the `kaveengayanga12` registry namespace. Update the image tags before applying them if you want to deploy a different build.
-
-## Notes
-
-- Do not commit real production secrets into these manifests.
-- If the PostgreSQL pod fails to start, confirm `/mnt/postgres-data` exists on the storage node and that the node selector is correct.
-- If the event registration API cannot connect to the database, verify that the `postgresdb` service is running and the secret values match the application config.
-- See [`K8S_MICROSERVICES_MIGRATION.md`](./K8S_MICROSERVICES_MIGRATION.md) for the full monolith-to-microservices migration log.
+See [`K8S_MICROSERVICES_MIGRATION.md`](./K8S_MICROSERVICES_MIGRATION.md) for
+the original monolith-to-microservices migration log.

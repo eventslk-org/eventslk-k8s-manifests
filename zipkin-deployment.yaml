@@ -1,0 +1,100 @@
+# ============================================================
+# zipkin-deployment.yaml
+# Zipkin distributed-tracing collector + UI (in-memory storage).
+#
+# IMPORTANT — the services do NOT emit traces yet. Deploying this
+# gives you the collector/UI, but until the Spring API adds the
+# tracing dependencies below, nothing will appear here:
+#
+#   pom.xml (event-registration-api):
+#     io.micrometer : micrometer-tracing-bridge-brave
+#     io.zipkin.reporter2 : zipkin-reporter-brave
+#
+#   application-prod.yml:
+#     management:
+#       zipkin:
+#         tracing:
+#           endpoint: ${ZIPKIN_ENDPOINT:http://zipkin:9411/api/v2/spans}
+#       tracing:
+#         sampling:
+#           probability: 0.1     # 10% in prod; 1.0 while testing
+#
+# The JSON log pattern in application-prod.yml already prints
+# %X{traceId}/%X{spanId}, so traces correlate with logs as soon
+# as the bridge is on the classpath.
+#
+# Storage is in-memory (spans lost on restart, capped) — fine for
+# a single-team setup; move to Elasticsearch storage if you need
+# retention.
+#
+# UI access: cluster-internal on zipkin:9411. Reach it from your
+# workstation with:
+#   kubectl port-forward svc/zipkin 9411:9411
+# Do NOT expose it on a NodePort — the security group opens the
+# whole NodePort range to the internet and Zipkin has no auth.
+# ============================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zipkin
+  labels:
+    app: zipkin
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zipkin
+  template:
+    metadata:
+      labels:
+        app: zipkin
+    spec:
+      nodeSelector:
+        node-role: application
+      containers:
+        - name: zipkin
+          image: openzipkin/zipkin:3
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9411
+          env:
+            - name: STORAGE_TYPE
+              value: mem
+            # Cap in-memory spans so the pod stays inside its limits.
+            - name: MEM_MAX_SPANS
+              value: "100000"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9411
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9411
+            initialDelaySeconds: 60
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zipkin
+  labels:
+    app: zipkin
+spec:
+  type: ClusterIP
+  selector:
+    app: zipkin
+  ports:
+    - name: http
+      port: 9411
+      targetPort: 9411

@@ -156,3 +156,59 @@ kubectl delete -f postgres-deployment.yaml
 ```
 
 The deleted `mysql-deployment.yaml` and `backend-deployment.yaml` files are available in git history if a legacy rollback is required.
+
+---
+
+# Stateful Infrastructure & HA Datastores
+
+**Date:** 2026-06-08
+**Topic:** In-cluster Kafka message bus + high-availability PostgreSQL and Redis for the production profile.
+
+## Why
+
+The microservice manifests referenced infrastructure that did not exist as manifests:
+
+- `notification-deployment.yaml` consumed Kafka at `kafka:29092`, but there was no Kafka manifest — the broker was assumed to be supplied externally.
+- `application-prod.yml` describes a primary/replica PostgreSQL split (`DB_PRIMARY_HOST` / `DB_REPLICA_HOSTS`) and a Redis Sentinel topology (`REDIS_SENTINEL_*`), neither of which had manifests.
+
+These three stateful systems are now defined in-cluster.
+
+## Created
+
+- `kafka-deployment.yaml` — KRaft (no ZooKeeper) Kafka, 3-broker `StatefulSet` with combined broker+controller roles, `kafka-headless` for per-broker DNS and the controller quorum, `kafka` ClusterIP as the `29092` bootstrap endpoint, and a `kafka-topic-init` Job that creates all five notification topics with `replication-factor 3` / `min.insync.replicas 2`. PodAntiAffinity spreads brokers across nodes. `node-role=application`.
+- `postgres-ha-deployment.yaml` — `postgres-primary` StatefulSet (writes, WAL streaming source) + `postgres-replica` StatefulSet (2 hot standbys). Standbys clone the primary with `pg_basebackup -R -C --slot` in an initContainer and stream WAL through per-replica slots. `postgres-primary` ClusterIP is the write endpoint; `postgres-replica` is headless for per-standby DNS (for JDBC read load balancing). Credentials in `postgres-ha-secret`. Uses `volumeClaimTemplates` (StorageClass) rather than hostPath. `node-role=storage`.
+- `redis-sentinel-deployment.yaml` — `redis` StatefulSet of 3 nodes, each running a `redis` data container and a `sentinel` sidecar (master `evtreg-master`, quorum 2). Nodes self-discover the master via the sentinels on boot; `redis-0` seeds the master on a cold cluster. `redis-sentinel` ClusterIP + `redis-headless` for per-pod DNS. Credentials in `redis-ha-secret`. `node-role=application`.
+
+## Modified
+
+- `event-api-deployment.yaml` — added `KAFKA_BOOTSTRAP_SERVERS` / `SPRING_KAFKA_BOOTSTRAP_SERVERS = kafka:29092` so the producer side of the notification pipeline reaches the in-cluster broker (previously defaulted to `localhost:9092`).
+- `README.md` — documented the three new components, prerequisites (StorageClass), and dev-vs-prod apply orders.
+
+## Port / Service Map (additions)
+
+| Service | Type | Port | Purpose |
+|---|---|---|---|
+| `kafka` | ClusterIP | 29092 | Kafka bootstrap (producer + consumer) |
+| `kafka-headless` | Headless | 29092 / 9093 | Per-broker DNS + KRaft controller quorum |
+| `postgres-primary` | ClusterIP | 5432 | Write endpoint (`DB_PRIMARY_HOST`) |
+| `postgres-replica` | Headless | 5432 | Read replicas (`DB_REPLICA_HOSTS`) |
+| `redis-sentinel` | ClusterIP | 26379 | Sentinel discovery (`REDIS_SENTINEL_NODES`) |
+| `redis-headless` | Headless | 6379 / 26379 | Per-pod redis + sentinel DNS |
+
+## Production wiring (when `SPRING_PROFILES_ACTIVE=prod`)
+
+The HA datastores match the env contract in `application-prod.yml`:
+
+```
+DB_PRIMARY_HOST=postgres-primary
+DB_PRIMARY_PORT=5432
+DB_NAME=event_reg_db
+DB_REPLICA_HOSTS=postgres-replica-0.postgres-replica.default.svc.cluster.local:5432,postgres-replica-1.postgres-replica.default.svc.cluster.local:5432
+REDIS_SENTINEL_MASTER=evtreg-master
+REDIS_SENTINEL_NODES=redis-0.redis-headless.default.svc.cluster.local:26379,redis-1.redis-headless.default.svc.cluster.local:26379,redis-2.redis-headless.default.svc.cluster.local:26379
+KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+```
+
+## Security hardening (left as follow-up)
+
+To keep the manifests consistent with the existing `dev`-profile stack, the in-cluster traffic is PLAINTEXT. For real production, layer on what `application-prod.yml` already anticipates: Kafka `SASL_SSL` + `SCRAM-SHA-512`, Postgres `sslmode=require` with server certs, Redis TLS, and real secret values delivered through a secret manager (the `*-secret` objects ship with `CHANGE_ME` placeholders).

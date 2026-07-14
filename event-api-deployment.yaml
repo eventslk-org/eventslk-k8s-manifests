@@ -1,8 +1,35 @@
 # ============================================================
 # event-api-deployment.yaml
-# Core event-registration microservice. Talks to PostgreSQL
-# via the in-cluster `postgresdb` service and re-uses the
-# existing `backend-secret` for the JWT signing key.
+# Core event-registration microservice, production profile.
+#
+# Runs with SPRING_PROFILES_ACTIVE=prod (application-prod.yml):
+#   - Flyway owns the schema (ddl-auto: validate)
+#   - Redis Sentinel caching        -> redis-sentinel-deployment.yaml
+#   - HA PostgreSQL                 -> postgres-ha-deployment.yaml
+#   - Kafka producer (outbox)       -> kafka-deployment.yaml
+#   - Actuator on separate port 9081 (never exposed publicly)
+#
+# IMPORTANT quirks of application-prod.yml this manifest satisfies:
+#   * spring.datasource.primary/replica blocks are NOT wired to any
+#     RoutingDataSource bean yet — the app still reads the standard
+#     SPRING_DATASOURCE_URL. Point it at the postgres-primary write
+#     endpoint. (When a RoutingDataSource is implemented, switch to
+#     DB_PRIMARY_HOST / DB_REPLICA_HOSTS.)
+#   * spring.kafka.properties.sasl.jaas.config is a BOUND property —
+#     KAFKA_SASL_JAAS_CONFIG must exist (empty is fine) or the app
+#     fails to boot. In-cluster Kafka is PLAINTEXT, so the SASL_SSL
+#     defaults are overridden.
+#   * EUREKA_DEFAULT_ZONE has no default in the prod profile.
+#   * Tomcat access logs write to /var/log/evtreg and the container
+#     runs as non-root (uid 10001) — an emptyDir is mounted there.
+#
+# Required secrets (create before applying — see README):
+#   postgres-ha-secret  POSTGRES_USER / POSTGRES_PASSWORD (from postgres-ha-deployment.yaml)
+#   redis-ha-secret     REDIS_PASSWORD / REDIS_SENTINEL_PASSWORD (from redis-sentinel-deployment.yaml)
+#   backend-secret      JWT_PRIVATE_KEY / JWT_PUBLIC_KEY (RS256 PEM, \n-escaped)
+#                       APP_ADMIN_EMAIL / APP_ADMIN_PASSWORD (seed admin)
+#   aws-s3-secret       AWS_S3_ACCESS_KEY / AWS_S3_SECRET_KEY (optional —
+#                       prefer the EC2 instance role; see S3 section below)
 # ============================================================
 
 apiVersion: apps/v1
@@ -26,58 +53,158 @@ spec:
           image: kaveengayanga12/eventslk-event-registration-api:d629bb85d1bac5c1d1b3b15c6e85c56e51bdd878
           imagePullPolicy: Always
           ports:
-            - containerPort: 8081
+            - name: http
+              containerPort: 8081
+            - name: management
+              containerPort: 9081
           env:
             - name: SPRING_PROFILES_ACTIVE
-              value: dev
-            - name: EUREKA_CLIENT_SERVICEURL_DEFAULTZONE
+              value: prod
+            - name: MANAGEMENT_PORT
+              value: "9081"
+
+            # --- Service discovery (prod profile has no default zone) ---
+            - name: EUREKA_DEFAULT_ZONE
               value: http://eventslk-service-discovery:8761/eureka/
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
 
-            # --- Kafka (producer side of the notification pipeline) ---
-            # In-cluster broker provided by kafka-deployment.yaml. The
-            # NotificationProducer publishes booking/user events here; the
-            # eventslk-notification-service consumes them.
-            - name: KAFKA_BOOTSTRAP_SERVERS
-              value: kafka:29092
-            - name: SPRING_KAFKA_BOOTSTRAP_SERVERS
-              value: kafka:29092
-
-            # --- PostgreSQL datasource ---
+            # --- PostgreSQL (HA primary — write endpoint) ---
+            # No RoutingDataSource bean exists yet, so all traffic goes to
+            # the primary. Replicas still provide failover-promotion material
+            # and can serve reads once routing is implemented.
             - name: SPRING_DATASOURCE_URL
-              value: jdbc:postgresql://postgresdb:5432/event_reg_db
+              value: jdbc:postgresql://postgres-primary:5432/event_reg_db
             - name: SPRING_DATASOURCE_USERNAME
               valueFrom:
                 secretKeyRef:
-                  name: postgres-secret
+                  name: postgres-ha-secret
                   key: POSTGRES_USER
             - name: SPRING_DATASOURCE_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: postgres-secret
+                  name: postgres-ha-secret
                   key: POSTGRES_PASSWORD
-            - name: SPRING_JPA_HIBERNATE_DDL_AUTO
-              value: "update"
-            - name: SPRING_JPA_DATABASE_PLATFORM
-              value: org.hibernate.dialect.PostgreSQLDialect
 
-            # --- Auth ---
-            - name: JWT_SECRET
+            # --- Redis Sentinel (cache) ---
+            - name: REDIS_SENTINEL_MASTER
+              value: evtreg-master
+            - name: REDIS_SENTINEL_NODES
+              value: redis-0.redis-headless.default.svc.cluster.local:26379,redis-1.redis-headless.default.svc.cluster.local:26379,redis-2.redis-headless.default.svc.cluster.local:26379
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-ha-secret
+                  key: REDIS_PASSWORD
+            - name: REDIS_SENTINEL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-ha-secret
+                  key: REDIS_SENTINEL_PASSWORD
+            # In-cluster Redis has no TLS; the prod default is true.
+            - name: REDIS_SSL_ENABLED
+              value: "false"
+
+            # --- Kafka (outbox producer; in-cluster broker is PLAINTEXT) ---
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: kafka:29092
+            - name: KAFKA_SECURITY_PROTOCOL
+              value: PLAINTEXT
+            - name: KAFKA_SASL_MECHANISM
+              value: PLAIN
+            # Bound property — must exist even when SASL is unused.
+            - name: KAFKA_SASL_JAAS_CONFIG
+              value: ""
+
+            # --- JWT (RS256 keypair, \n-escaped PEM strings) ---
+            - name: JWT_PRIVATE_KEY
               valueFrom:
                 secretKeyRef:
                   name: backend-secret
-                  key: JWT_SECRET
+                  key: JWT_PRIVATE_KEY
+            - name: JWT_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secret
+                  key: JWT_PUBLIC_KEY
+
+            # --- Seed admin account (AdminUserInitializer) ---
+            - name: APP_ADMIN_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secret
+                  key: APP_ADMIN_EMAIL
+            - name: APP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secret
+                  key: APP_ADMIN_PASSWORD
+
+            # --- Public URLs (REPLACE with your domain / elastic IP) ---
+            # Browser origins of the two portals; the backend rejects
+            # any other Origin (strict CORS allowlist in prod).
+            - name: CORS_ALLOWED_ORIGINS
+              value: http://REPLACE_PUBLIC_HOST:30081,http://REPLACE_PUBLIC_HOST:30082
+            # Base URL used in verification-email links (client portal).
+            - name: APP_BASE_URL
+              value: http://REPLACE_PUBLIC_HOST:30081
+
+            # --- S3 event-image uploads (presigned PUT) ---
+            # Bucket + worker IAM role are provisioned by Terraform
+            # (deploy/infrastructure/terraform/application/s3.tf) — fill
+            # these from `terraform output event_images_bucket`. Leave
+            # AWS_S3_BUCKET empty to run in mock mode (placeholder image
+            # URLs, no AWS needed). Credentials come from the worker EC2
+            # instance role via the SDK default chain — OMIT the key env
+            # vars entirely.
+            - name: AWS_S3_BUCKET
+              value: "" # e.g. eventslk-event-images-<account-id>
+            - name: AWS_REGION
+              value: us-east-1 # must match the Terraform aws_region
+            - name: AWS_S3_PUBLIC_BASE_URL
+              value: ""
+            # Uncomment only if you must use static keys instead of the
+            # instance role:
+            # - name: AWS_S3_ACCESS_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: aws-s3-secret
+            #       key: AWS_S3_ACCESS_KEY
+            # - name: AWS_S3_SECRET_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: aws-s3-secret
+            #       key: AWS_S3_SECRET_KEY
+          volumeMounts:
+            # Tomcat access logs (prod profile) — container is non-root.
+            - name: access-logs
+              mountPath: /var/log/evtreg
+          # Prod exposes health on the management port with k8s probe groups.
           readinessProbe:
             httpGet:
-              path: /auth
-              port: 8081
+              path: /actuator/health/readiness
+              port: 9081
             initialDelaySeconds: 60
             periodSeconds: 10
+            failureThreshold: 6
           livenessProbe:
             httpGet:
-              path: /auth
-              port: 8081
+              path: /actuator/health/liveness
+              port: 9081
             initialDelaySeconds: 120
             periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 768Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: access-logs
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -91,3 +218,6 @@ spec:
     - name: http
       port: 8081
       targetPort: 8081
+    - name: management
+      port: 9081
+      targetPort: 9081

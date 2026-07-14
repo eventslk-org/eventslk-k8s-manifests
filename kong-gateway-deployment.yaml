@@ -1,18 +1,26 @@
 # ============================================================
 # kong-gateway-deployment.yaml
-# Kong API Gateway running in DB-less (declarative) mode on EKS.
+# Kong API Gateway running in DB-less (declarative) mode.
 # Replaces the Docker Compose Kong setup; host.docker.internal
 # upstream targets are swapped for cluster-local Service DNS.
 #
 # Contains:
 #   1. ConfigMap  kong-declarative-config  -> mounts kong.yaml
 #   2. Deployment kong-gateway             -> kong:3.5, DB-less
-#   3. Service    kong-proxy-svc           -> ClusterIP 8000/8001
-#   4. Ingress    kong-proxy-ingress       -> internet-facing ALB
-#                                              fronting proxy port 8000
+#   3. Service    kong-proxy-svc           -> NodePort 30080 (proxy ONLY)
+#   4. Service    kong-admin-svc           -> ClusterIP 8001 (admin, in-cluster only)
 #
-# NOTE: the admin port (8001) is intentionally ClusterIP-only and is
-# NEVER fronted by the ALB. Do not add it to the Ingress.
+# Exposure: this cluster is kubeadm + Calico on EC2 (not EKS), so an
+# ALB Ingress (aws-load-balancer-controller, target-type: ip) does not
+# work here — pod IPs are not VPC-routable. The proxy is exposed on
+# NodePort 30080 instead (the Terraform security group already opens
+# 30000-32767) and the frontends point API_BASE_URL at
+# http://<worker-public-ip-or-domain>:30080.
+#
+# NOTE: the admin port (8001) lives in its own ClusterIP Service and
+# must NEVER be added to the NodePort service — with the SG open on
+# the NodePort range that would publish the Kong admin API to the
+# internet.
 # ============================================================
 
 apiVersion: v1
@@ -41,8 +49,14 @@ data:
           - name: user-routes
             paths: [/user]
             strip_path: false
+      # Only the health probe is publicly routable; metrics/env/prometheus
+      # stay cluster-internal. In the prod profile actuator lives on the
+      # separate management port 9081, hence the dedicated upstream.
+      - name: core-actuator-service
+        host: EVENT-API-MGMT-UPSTREAM
+        routes:
           - name: core-actuator-routes
-            paths: [/actuator]
+            paths: [/actuator/health]
             strip_path: false
       - name: notification-api-service
         host: NOTIFICATION-SERVICE-UPSTREAM
@@ -57,6 +71,9 @@ data:
       - name: EVENT-REGISTRATION-API-UPSTREAM
         targets:
           - target: event-registration-api.default.svc.cluster.local:8081
+      - name: EVENT-API-MGMT-UPSTREAM
+        targets:
+          - target: event-registration-api.default.svc.cluster.local:9081
       - name: NOTIFICATION-SERVICE-UPSTREAM
         targets:
           - target: eventslk-notification-service.default.svc.cluster.local:8082
@@ -65,6 +82,15 @@ data:
         config:
           minute: 60
           policy: local
+      # SECURITY: the backend trusts X-User-* headers (GatewayHeaderFilter)
+      # when no Bearer token is present. Strip them from every inbound client
+      # request so only the gateway itself can ever set them.
+      - name: request-transformer
+        config:
+          remove:
+            headers:
+              - X-User-Name
+              - X-User-Roles
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -142,6 +168,11 @@ spec:
               - key: kong.yaml
                 path: kong.yaml
 ---
+# ------------------------------------------------------------
+# Public entry point: Kong proxy on NodePort 30080. This is the
+# ONLY externally reachable service of the whole stack besides
+# the two portals (30081/30082).
+# ------------------------------------------------------------
 apiVersion: v1
 kind: Service
 metadata:
@@ -149,44 +180,30 @@ metadata:
   labels:
     app: kong-gateway
 spec:
-  type: ClusterIP
+  type: NodePort
   selector:
     app: kong-gateway
   ports:
     - name: proxy
       port: 8000
       targetPort: 8000
+      nodePort: 30080
+---
+# ------------------------------------------------------------
+# Kong Admin API — in-cluster only. Never expose via NodePort,
+# LoadBalancer, or Ingress.
+# ------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: kong-admin-svc
+  labels:
+    app: kong-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app: kong-gateway
+  ports:
     - name: admin
       port: 8001
       targetPort: 8001
----
-# ------------------------------------------------------------
-# Internet-facing ALB fronting ONLY the Kong proxy port (8000).
-# Requires the AWS Load Balancer Controller installed in the
-# cluster. The admin port (8001) is deliberately excluded.
-# ------------------------------------------------------------
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: kong-proxy-ingress
-  labels:
-    app: kong-gateway
-  annotations:
-    kubernetes.io/ingress.class: alb
-    alb.ingress.kubernetes.io/scheme: internet-facing
-    alb.ingress.kubernetes.io/target-type: ip
-    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
-    # Health-check the Kong Admin API status endpoint on the proxy pods.
-    alb.ingress.kubernetes.io/healthcheck-port: "8001"
-    alb.ingress.kubernetes.io/healthcheck-path: /status
-spec:
-  rules:
-    - http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: kong-proxy-svc
-                port:
-                  number: 8000
