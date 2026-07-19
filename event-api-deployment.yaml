@@ -146,10 +146,10 @@ spec:
             # Browser origins of the two portals; the backend rejects
             # any other Origin (strict CORS allowlist in prod).
             - name: CORS_ALLOWED_ORIGINS
-              value: http://REPLACE_PUBLIC_HOST:30081,http://REPLACE_PUBLIC_HOST:30082
+              value: http://35.168.70.214:30081,http://35.168.70.214:30082
             # Base URL used in verification-email links (client portal).
             - name: APP_BASE_URL
-              value: http://REPLACE_PUBLIC_HOST:30081
+              value: http://35.168.70.214:30081
 
             # --- S3 event-image uploads (presigned PUT) ---
             # Bucket + worker IAM role are provisioned by Terraform
@@ -160,11 +160,11 @@ spec:
             # instance role via the SDK default chain — OMIT the key env
             # vars entirely.
             - name: AWS_S3_BUCKET
-              value: "" # e.g. eventslk-event-images-<account-id>
+              value: eventslk-event-images-611491981813
             - name: AWS_REGION
               value: us-east-1 # must match the Terraform aws_region
             - name: AWS_S3_PUBLIC_BASE_URL
-              value: ""
+              value: https://eventslk-event-images-611491981813.s3.us-east-1.amazonaws.com
             # Uncomment only if you must use static keys instead of the
             # instance role:
             # - name: AWS_S3_ACCESS_KEY

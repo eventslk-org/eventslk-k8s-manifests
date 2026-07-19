@@ -43,7 +43,7 @@ spec:
             # localhost or a cluster-internal name. REPLACE with your
             # domain / elastic IP.
             - name: API_BASE_URL
-              value: http://REPLACE_PUBLIC_HOST:30080
+              value: http://35.168.70.214:30080
           # Readiness probe — only route traffic here once Nginx serves the root page
           readinessProbe:
             httpGet:

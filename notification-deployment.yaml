@@ -50,7 +50,7 @@ spec:
             # booking confirmations) — must be the PUBLIC client-portal
             # URL. REPLACE with your domain / elastic IP.
             - name: APP_BASE_URL
-              value: http://REPLACE_PUBLIC_HOST:30081
+              value: http://35.168.70.214:30081
             - name: MAIL_FROM
               value: no-reply@eventslk.com
             - name: BREVO_API_KEY

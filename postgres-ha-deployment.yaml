@@ -29,22 +29,10 @@
 # ============================================================
 
 # ------------------------------------------------------------
-# 1. Credentials. Replace these before applying — do not commit
-#    real production secrets. REPLICATION_* drives the physical
+# 1. Credentials: the `postgres-ha-secret` Secret is created out of
+#    band with `kubectl create secret` (README § Prerequisites) so
+#    real values never land in git. REPLICATION_* drives the physical
 #    streaming-replication connection from standbys to the primary.
-# ------------------------------------------------------------
-apiVersion: v1
-kind: Secret
-metadata:
-  name: postgres-ha-secret
-type: Opaque
-stringData:
-  POSTGRES_DB: event_reg_db
-  POSTGRES_USER: evtreg
-  POSTGRES_PASSWORD: "CHANGE_ME_app_password"
-  REPLICATION_USER: replicator
-  REPLICATION_PASSWORD: "CHANGE_ME_replication_password"
----
 # ------------------------------------------------------------
 # 2. Primary init script. Runs once on first boot of the primary:
 #    creates the replication role and opens pg_hba for streaming

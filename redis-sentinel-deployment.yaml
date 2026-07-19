@@ -24,17 +24,9 @@
 # ============================================================
 
 # ------------------------------------------------------------
-# 1. Credentials. Replace before applying.
-# ------------------------------------------------------------
-apiVersion: v1
-kind: Secret
-metadata:
-  name: redis-ha-secret
-type: Opaque
-stringData:
-  REDIS_PASSWORD: "CHANGE_ME_redis_password"
-  REDIS_SENTINEL_PASSWORD: "CHANGE_ME_sentinel_password"
----
+# 1. Credentials: the `redis-ha-secret` Secret is created out of
+#    band with `kubectl create secret` (README § Prerequisites) so
+#    real values never land in git.
 # ------------------------------------------------------------
 # 2. Startup scripts + config templates for the redis and
 #    sentinel containers. Templates are copied to a writable
