@@ -52,7 +52,7 @@ spec:
             - name: APP_BASE_URL
               value: http://35.168.70.214:30081
             - name: MAIL_FROM
-              value: no-reply@eventslk.com
+              value: orderhert@gmail.com
             - name: BREVO_API_KEY
               valueFrom:
                 secretKeyRef:
