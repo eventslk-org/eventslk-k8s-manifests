@@ -33,7 +33,7 @@ spec:
         - name: client-portal
           # GitHub Actions pushes to this repository on every merge to main.
           # The CI workflow re-tags the image as 'latest' after pushing the SHA tag.
-          image: kaveengayanga12/eventslk-client-portal:e10c3e101e4d52f887562ba7beafd3b2a6878088
+          image: kaveengayanga12/eventslk-client-portal:a4a2eeb801e1e5ddd0c29c6bd20ce0b313ccc0ba
           imagePullPolicy: Always # Always pull so the freshly built image is used after each CI push
           ports:
             - containerPort: 80 # Nginx serves the built React app on port 80
