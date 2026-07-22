@@ -15,7 +15,7 @@ kind: Deployment
 metadata:
   name: client-portal
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: client-portal
@@ -70,6 +70,6 @@ spec:
     app: client-portal
   ports:
     - name: http
-      port: 80       # ClusterIP port (used for internal cluster traffic)
+      port: 80 # ClusterIP port (used for internal cluster traffic)
       targetPort: 80 # Port Nginx listens on inside the container
       nodePort: 30081 # External port — reachable at <NodeIP>:30081
